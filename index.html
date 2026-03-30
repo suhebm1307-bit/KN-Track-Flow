@@ -1,0 +1,193 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+#  KN Track Flow v1.0 — Ubuntu 22.04 VM Deployment Script
+#  Usage: sudo bash deploy/deploy.sh
+#  Requires: Fresh Ubuntu 22.04 LTS with internet access
+# ═══════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+APP_NAME="kn-trackflow"
+APP_DIR="/opt/kn-trackflow"
+APP_USER="kn-app"
+DB_NAME="kn_trackflow"
+DB_USER="kn_db_user"
+DB_PASS="$(openssl rand -base64 20 | tr -dc 'A-Za-z0-9' | head -c 24)"
+SESSION_SECRET="$(openssl rand -hex 48)"
+NODE_VERSION="20"
+PORT=3000
+
+echo ""
+echo "╔══════════════════════════════════════════════╗"
+echo "║   KN Track Flow v1.0 — VM Deployment         ║"
+echo "╚══════════════════════════════════════════════╝"
+echo ""
+
+# ── [1/10] System packages ───────────────────────────────────
+echo "[1/10] Installing system packages..."
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  curl git nginx mysql-server ufw openssl
+
+# ── [2/10] Node.js ───────────────────────────────────────────
+echo "[2/10] Installing Node.js ${NODE_VERSION}..."
+curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - >/dev/null
+apt-get install -y nodejs
+echo "       Node.js $(node --version) installed"
+
+# ── [3/10] PM2 ───────────────────────────────────────────────
+echo "[3/10] Installing PM2..."
+npm install -g pm2 --silent
+pm2 completion install 2>/dev/null || true
+
+# ── [4/10] MySQL ─────────────────────────────────────────────
+echo "[4/10] Configuring MySQL..."
+systemctl enable --now mysql
+mysql -u root <<SQL
+  CREATE DATABASE IF NOT EXISTS ${DB_NAME}
+    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost'
+    IDENTIFIED BY '${DB_PASS}';
+  GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
+  FLUSH PRIVILEGES;
+SQL
+echo "       MySQL database '${DB_NAME}' ready"
+
+# ── [5/10] App directory ─────────────────────────────────────
+echo "[5/10] Setting up application directory..."
+useradd -r -s /bin/false -d ${APP_DIR} ${APP_USER} 2>/dev/null || true
+mkdir -p ${APP_DIR}
+rsync -a --exclude='.git' --exclude='node_modules' --exclude='.env' \
+  "$(dirname "$(realpath "$0")")/../" "${APP_DIR}/"
+chown -R ${APP_USER}:${APP_USER} ${APP_DIR}
+
+# ── [6/10] Environment ───────────────────────────────────────
+echo "[6/10] Writing .env..."
+cat > "${APP_DIR}/.env" <<ENV
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASS=${DB_PASS}
+PORT=${PORT}
+HOST=127.0.0.1
+NODE_ENV=production
+SESSION_SECRET=${SESSION_SECRET}
+SESSION_MAX_AGE_HOURS=8
+RATE_LIMIT_MAX_REQUESTS=300
+ENV
+chmod 600 "${APP_DIR}/.env"
+chown ${APP_USER}:${APP_USER} "${APP_DIR}/.env"
+
+# ── [7/10] npm + DB init ─────────────────────────────────────
+echo "[7/10] Installing dependencies and initialising database..."
+cd "${APP_DIR}"
+sudo -u ${APP_USER} npm ci --omit=dev --silent
+sudo -u ${APP_USER} node scripts/init-db.js
+sudo -u ${APP_USER} node scripts/seed.js
+
+# ── [8/10] PM2 ───────────────────────────────────────────────
+echo "[8/10] Configuring PM2..."
+mkdir -p /var/log/kn-trackflow
+chown -R ${APP_USER}:${APP_USER} /var/log/kn-trackflow
+
+cat > "${APP_DIR}/ecosystem.config.js" <<ECOS
+module.exports = {
+  apps: [{
+    name: '${APP_NAME}',
+    script: './server.js',
+    cwd: '${APP_DIR}',
+    instances: 'max',
+    exec_mode: 'cluster',
+    env: { NODE_ENV: 'production', PORT: ${PORT} },
+    error_file: '/var/log/kn-trackflow/err.log',
+    out_file:   '/var/log/kn-trackflow/out.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    max_memory_restart: '512M',
+    restart_delay: 2000,
+    watch: false,
+  }]
+};
+ECOS
+
+pm2 start "${APP_DIR}/ecosystem.config.js"
+pm2 save
+
+# Auto-start on reboot
+env PATH=$PATH:/usr/bin \
+  /usr/lib/node_modules/pm2/bin/pm2 startup systemd \
+  -u ${APP_USER} --hp "${APP_DIR}" | tail -1 | bash
+
+# ── [9/10] Nginx ─────────────────────────────────────────────
+echo "[9/10] Configuring Nginx..."
+cat > /etc/nginx/sites-available/kn-trackflow <<'NGINX'
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 25M;
+    gzip on;
+    gzip_types text/plain application/json application/javascript text/css;
+    gzip_min_length 1024;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade      $http_upgrade;
+        proxy_set_header   Connection   'upgrade';
+        proxy_set_header   Host         $host;
+        proxy_set_header   X-Real-IP    $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        proxy_read_timeout 60s;
+        proxy_connect_timeout 10s;
+    }
+
+    location ~* \.(js|css|png|jpg|gif|ico|woff2?)$ {
+        proxy_pass http://127.0.0.1:3000;
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    add_header X-Frame-Options        "SAMEORIGIN"    always;
+    add_header X-Content-Type-Options "nosniff"       always;
+    add_header X-XSS-Protection       "1; mode=block" always;
+    add_header Referrer-Policy        "strict-origin"  always;
+}
+NGINX
+
+ln -sf /etc/nginx/sites-available/kn-trackflow /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl reload nginx
+
+# ── [10/10] Firewall ─────────────────────────────────────────
+echo "[10/10] Configuring firewall..."
+ufw allow 22/tcp  comment 'SSH'
+ufw allow 80/tcp  comment 'HTTP'
+ufw allow 443/tcp comment 'HTTPS'
+ufw --force enable
+
+# ── Summary ──────────────────────────────────────────────────
+SERVER_IP=$(hostname -I | awk '{print $1}')
+echo ""
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║   KN Track Flow — Deployment Complete!                    ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+printf "║   URL:         http://%-34s ║\n" "${SERVER_IP}"
+printf "║   App dir:     %-36s ║\n" "${APP_DIR}"
+printf "║   DB Name:     %-36s ║\n" "${DB_NAME}"
+printf "║   DB User:     %-36s ║\n" "${DB_USER}"
+printf "║   DB Pass:     %-36s ║\n" "${DB_PASS}"
+echo "║                                                           ║"
+echo "║   Login:  admin / admin123   ← CHANGE IMMEDIATELY!       ║"
+echo "║           operator / wms2024 ← CHANGE IMMEDIATELY!       ║"
+echo "║                                                           ║"
+echo "║   pm2 status          → App status                       ║"
+echo "║   pm2 logs kn-trackflow → Live logs                      ║"
+echo "║   pm2 restart kn-trackflow → Restart app                 ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo ""
+echo "  ⚠  IMPORTANT: Save the DB password. It is in ${APP_DIR}/.env"
+echo "  ⚠  Change both passwords via Settings → User Management"
+echo ""

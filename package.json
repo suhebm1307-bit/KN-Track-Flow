@@ -1,0 +1,331 @@
+'use strict';
+
+const router = require('express').Router();
+const pool   = require('../db');
+const { addAudit, sanitise, validStatus, parseDate } = require('../helpers');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
+
+// ── GET /api/orders ──────────────────────────────────────────────
+router.get('/', requireAuth, async (req, res) => {
+  try {
+    const {
+      status, client, carrier, country, q,
+      page = 1, limit = 50,
+      sort = 'scheduled_ship_date', dir = 'asc',
+      archived = '0',
+    } = req.query;
+
+    const perPage = Math.min(parseInt(limit) || 50, 500);
+    const offset  = (Math.max(parseInt(page), 1) - 1) * perPage;
+
+    const SORTABLE = new Set(['order_no','shipment_no','client_id','customer_name',
+      'dest_country','carrier','scheduled_ship_date','inbound_dt','outbound_dt','status']);
+    const sortCol = SORTABLE.has(sort) ? `o.${sort}` : 'o.scheduled_ship_date';
+    const sortDir = dir === 'desc' ? 'DESC' : 'ASC';
+
+    let where = ['o.is_deleted = 0'];
+    const params = [];
+
+    if (archived !== '1') where.push('o.is_archived = 0');
+    if (status && status !== 'all') { where.push('o.status = ?'); params.push(status); }
+    if (client)  { where.push('o.client_id = ?');    params.push(client); }
+    if (carrier) { where.push('o.carrier = ?');      params.push(carrier); }
+    if (country) { where.push('o.dest_country = ?'); params.push(country); }
+    if (q) {
+      where.push('MATCH(o.order_no, o.shipment_no, o.client_id, o.customer_name, o.tracking_no) AGAINST(? IN BOOLEAN MODE)');
+      params.push(q + '*');
+    }
+
+    const whereStr = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+    const [countRows] = await pool.execute(
+      `SELECT COUNT(DISTINCT o.id) AS total FROM orders o ${whereStr}`,
+      params
+    );
+    const total = countRows[0].total;
+    const pages = Math.ceil(total / perPage) || 1;
+
+    const [rows] = await pool.execute(
+      `SELECT o.*,
+              COUNT(p.id) AS pallet_count,
+              GROUP_CONCAT(DISTINCT p.staging_loc ORDER BY p.seq_no SEPARATOR ', ') AS staging_locs
+       FROM orders o
+       LEFT JOIN pallets p ON p.order_no = o.order_no
+       ${whereStr}
+       GROUP BY o.id
+       ORDER BY ${sortCol} ${sortDir}
+       LIMIT ? OFFSET ?`,
+      [...params, perPage, offset]
+    );
+
+    res.json({ orders: rows, total, page: parseInt(page), pages, perPage });
+  } catch (err) {
+    console.error('[orders/GET]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/orders/:orderNo ─────────────────────────────────────
+router.get('/:orderNo', requireAuth, async (req, res) => {
+  try {
+    const [orders] = await pool.execute(
+      'SELECT * FROM orders WHERE order_no = ? LIMIT 1',
+      [req.params.orderNo]
+    );
+    if (!orders.length) return res.status(404).json({ error: 'Order not found' });
+
+    const [pallets] = await pool.execute(
+      'SELECT * FROM pallets WHERE order_no = ? ORDER BY seq_no',
+      [req.params.orderNo]
+    );
+
+    res.json({ order: orders[0], pallets });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/orders ─────────────────────────────────────────────
+router.post('/', requireAuth, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const b = req.body;
+    const pallets = Array.isArray(b.pallets) ? b.pallets : [];
+    if (!b.orderNo || !b.shipmentNo || !b.clientId) {
+      return res.status(400).json({ error: 'orderNo, shipmentNo, clientId are required' });
+    }
+
+    await conn.execute(
+      `INSERT INTO orders
+         (order_no, shipment_no, client_id, customer_name, dest_country,
+          carrier, service_level, tracking_no, scheduled_ship_date,
+          inbound_dt, outbound_dt, status, internal_ref, shipping_notes)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        sanitise(b.orderNo, 60), sanitise(b.shipmentNo, 60), sanitise(b.clientId, 40),
+        sanitise(b.customerName, 120), sanitise(b.destCountry, 80),
+        sanitise(b.carrier, 80), sanitise(b.serviceLevel, 60), sanitise(b.trackingNo, 120),
+        parseDate(b.scheduledShipDate), parseDate(b.inboundDt), parseDate(b.outboundDt),
+        validStatus(b.status), sanitise(b.internalRef, 255), sanitise(b.shippingNotes),
+      ]
+    );
+
+    for (let i = 0; i < pallets.length; i++) {
+      const p = pallets[i];
+      await conn.execute(
+        `INSERT INTO pallets (order_no, pallet_id, pkg_type, location_type, staging_loc, notes, status, seq_no)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        [
+          b.orderNo, sanitise(p.palletId, 60), sanitise(p.pkgType, 60),
+          p.locationType || 'rack', sanitise(p.stagingLoc, 80),
+          sanitise(p.notes, 255), validStatus(b.status), i + 1,
+        ]
+      );
+    }
+
+    await addAudit(conn, {
+      userId: req.user.id, userName: req.user.name,
+      action: 'create', entity: 'order', entityId: b.orderNo,
+      after: { orderNo: b.orderNo, status: b.status, pallets: pallets.length },
+    });
+
+    await conn.commit();
+    res.status(201).json({ orderNo: b.orderNo });
+  } catch (err) {
+    await conn.rollback();
+    if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Order number already exists' });
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ── PUT /api/orders/:orderNo ─────────────────────────────────────
+router.put('/:orderNo', requireAuth, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const b = req.body;
+    const on = req.params.orderNo;
+    const pallets = Array.isArray(b.pallets) ? b.pallets : [];
+
+    const [existing] = await conn.execute(
+      'SELECT status FROM orders WHERE order_no = ? FOR UPDATE',
+      [on]
+    );
+    if (!existing.length) return res.status(404).json({ error: 'Order not found' });
+
+    const newStatus = validStatus(b.status);
+    let outDt = parseDate(b.outboundDt);
+    if (newStatus === 'dispatched' && !outDt) outDt = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    if (newStatus !== 'dispatched' && !b.outboundDt) outDt = null;
+
+    await conn.execute(
+      `UPDATE orders SET
+         shipment_no=?, client_id=?, customer_name=?, dest_country=?,
+         carrier=?, service_level=?, tracking_no=?,
+         scheduled_ship_date=?, inbound_dt=?, outbound_dt=?,
+         status=?, internal_ref=?, shipping_notes=?, updated_at=NOW()
+       WHERE order_no=?`,
+      [
+        sanitise(b.shipmentNo,60), sanitise(b.clientId,40), sanitise(b.customerName,120),
+        sanitise(b.destCountry,80), sanitise(b.carrier,80), sanitise(b.serviceLevel,60),
+        sanitise(b.trackingNo,120), parseDate(b.scheduledShipDate), parseDate(b.inboundDt),
+        outDt, newStatus, sanitise(b.internalRef,255), sanitise(b.shippingNotes), on,
+      ]
+    );
+
+    // Replace pallets
+    await conn.execute('DELETE FROM pallets WHERE order_no = ?', [on]);
+    for (let i = 0; i < pallets.length; i++) {
+      const p = pallets[i];
+      await conn.execute(
+        `INSERT INTO pallets (order_no, pallet_id, pkg_type, location_type, staging_loc, notes, status, seq_no)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        [on, sanitise(p.palletId,60), sanitise(p.pkgType,60),
+         p.locationType||'rack', sanitise(p.stagingLoc,80),
+         sanitise(p.notes,255), newStatus, i+1]
+      );
+    }
+
+    await addAudit(conn, {
+      userId: req.user.id, userName: req.user.name,
+      action: 'update', entity: 'order', entityId: on,
+      before: { status: existing[0].status },
+      after:  { status: newStatus, pallets: pallets.length },
+    });
+
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ── DELETE /api/orders/:orderNo ──────────────────────────────────
+router.delete('/:orderNo', requireAuth, async (req, res) => {
+  try {
+    const on = req.params.orderNo;
+    const [rows] = await pool.execute('SELECT status FROM orders WHERE order_no=?', [on]);
+    if (!rows.length) return res.status(404).json({ error: 'Order not found' });
+
+    await pool.execute(
+      "UPDATE orders SET status='deleted', is_deleted=1, updated_at=NOW() WHERE order_no=?", [on]
+    );
+    await pool.execute("UPDATE pallets SET status='deleted', updated_at=NOW() WHERE order_no=?", [on]);
+
+    await addAudit(pool, {
+      userId: req.user.id, userName: req.user.name,
+      action: 'delete', entity: 'order', entityId: on,
+      before: { status: rows[0].status }, after: { status: 'deleted' },
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/orders/:orderNo/dispatch ───────────────────────────
+router.post('/:orderNo/dispatch', requireAuth, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const on  = req.params.orderNo;
+    const now = new Date().toISOString().slice(0,19).replace('T',' ');
+
+    const [rows] = await conn.execute(
+      'SELECT status FROM orders WHERE order_no=? FOR UPDATE', [on]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Order not found' });
+    if (rows[0].status === 'dispatched') return res.status(400).json({ error: 'Already dispatched' });
+    if (['archived','deleted'].includes(rows[0].status))
+      return res.status(400).json({ error: `Cannot dispatch — status is: ${rows[0].status}` });
+
+    await conn.execute(
+      `UPDATE orders SET status='dispatched', outbound_dt=?,
+       dispatched_at=?, inbound_dt=COALESCE(inbound_dt,?), updated_at=NOW()
+       WHERE order_no=?`,
+      [now, now, now, on]
+    );
+    await conn.execute(
+      "UPDATE pallets SET status='dispatched', updated_at=NOW() WHERE order_no=?", [on]
+    );
+
+    const [cnt] = await conn.execute('SELECT COUNT(*) AS c FROM pallets WHERE order_no=?', [on]);
+
+    await addAudit(conn, {
+      userId: req.user.id, userName: req.user.name,
+      action: 'dispatch', entity: 'order', entityId: on,
+      before: { status: rows[0].status },
+      after:  { status: 'dispatched', outbound_dt: now, pallets: cnt[0].c },
+    });
+
+    await conn.commit();
+    res.json({ ok: true, message: `Dispatched ${cnt[0].c} pallet(s)`, pallets: cnt[0].c });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ── POST /api/orders/:orderNo/archive ────────────────────────────
+router.post('/:orderNo/archive', requireAuth, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const on = req.params.orderNo;
+    const [rows] = await conn.execute('SELECT status FROM orders WHERE order_no=? FOR UPDATE',[on]);
+    if (!rows.length) return res.status(404).json({ error: 'Order not found' });
+    if (['archived','deleted'].includes(rows[0].status))
+      return res.status(400).json({ error: `Already ${rows[0].status}` });
+
+    await conn.execute(
+      `UPDATE orders SET restore_status=status, status='archived',
+       is_archived=1, archived_at=NOW(), updated_at=NOW() WHERE order_no=?`, [on]
+    );
+    await conn.execute(
+      "UPDATE pallets SET status='archived', updated_at=NOW() WHERE order_no=?", [on]
+    );
+    await addAudit(conn, {
+      userId: req.user.id, userName: req.user.name,
+      action: 'archive', entity: 'order', entityId: on,
+      before: { status: rows[0].status }, after: { status: 'archived' },
+    });
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ── POST /api/orders/:orderNo/restore-deleted ────────────────────
+router.post('/:orderNo/restore-deleted', requireAuth, async (req, res) => {
+  try {
+    const on = req.params.orderNo;
+    await pool.execute(
+      "UPDATE orders SET status='pending', is_deleted=0, updated_at=NOW() WHERE order_no=?", [on]
+    );
+    await pool.execute(
+      "UPDATE pallets SET status='pending', updated_at=NOW() WHERE order_no=?", [on]
+    );
+    await addAudit(pool, {
+      userId: req.user.id, userName: req.user.name,
+      action: 'restore', entity: 'order', entityId: on,
+      before: { status: 'deleted' }, after: { status: 'pending' },
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;

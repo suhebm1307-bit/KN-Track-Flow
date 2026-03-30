@@ -1,0 +1,188 @@
+'use strict';
+
+const router = require('express').Router();
+const multer = require('multer');
+const pool   = require('../db');
+const { addAudit, sanitise, validStatus, parseDate, genId } = require('../helpers');
+const { requireAuth } = require('../middleware/auth');
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /\.(csv|txt|xlsx|xls)$/i.test(file.originalname);
+    cb(ok ? null : new Error('Only CSV or Excel files accepted'), ok);
+  },
+});
+
+// CSV column → DB field mapping
+const COL_MAP = {
+  'client id':           'client_id',
+  'customer name':       'customer_name',
+  'destination country': 'dest_country',
+  'order number':        'order_no',
+  'shipment no.':        'shipment_no',
+  'shipment no':         'shipment_no',
+  'pallet id / lpn':     'pallet_id',
+  'pallet id/lpn':       'pallet_id',
+  'package type':        'pkg_type',
+  'location type':       'location_type',
+  'staging location':    'staging_loc',
+  'carrier':             'carrier',
+  'service level':       'service_level',
+  'tracking number':     'tracking_no',
+  'scheduled ship date': 'scheduled_ship_date',
+  'inbound date':        'inbound_dt',
+  'outbound date':       'outbound_dt',
+  'status':              'status',
+  'internal reference':  'internal_ref',
+  'shipping notes':      'shipping_notes',
+};
+
+function parseCSVBuffer(buf) {
+  const text    = buf.toString('utf8');
+  const lines   = text.split(/\r?\n/).filter(l => l.trim());
+  if (!lines.length) return [];
+  const headers = lines[0].split(',').map(h => h.replace(/^"|"$/g, '').trim().toLowerCase());
+  return lines.slice(1).map(line => {
+    const vals = line.split(',').map(v => v.replace(/^"|"$/g, '').trim());
+    const row  = {};
+    headers.forEach((h, i) => {
+      const key = COL_MAP[h] || h;
+      row[key] = vals[i] || '';
+    });
+    return row;
+  }).filter(r => r.order_no);
+}
+
+// POST /api/import/csv
+router.post('/csv', requireAuth, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const mode = req.body.mode || 'append';
+
+  try {
+    let rawRows;
+
+    if (/\.xlsx?$/i.test(req.file.originalname)) {
+      const XLSX = require('xlsx');
+      const wb   = XLSX.read(req.file.buffer, { type: 'buffer', dateNF: 'dd/mm/yyyy' });
+      const ws   = wb.Sheets[wb.SheetNames[0]];
+      const data = XLSX.utils.sheet_to_json(ws, { raw: false });
+      rawRows = data.map(row => {
+        const mapped = {};
+        Object.entries(row).forEach(([k, v]) => {
+          const key = COL_MAP[k.trim().toLowerCase()] || k.trim().toLowerCase();
+          mapped[key] = v || '';
+        });
+        return mapped;
+      }).filter(r => r.order_no);
+    } else {
+      rawRows = parseCSVBuffer(req.file.buffer);
+    }
+
+    if (!rawRows.length) return res.status(400).json({ error: 'No valid rows found — check column headers' });
+
+    const conn = await pool.getConnection();
+    let added = 0, updated = 0, skipped = 0;
+    const errors = [];
+
+    try {
+      await conn.beginTransaction();
+
+      if (mode === 'replace') {
+        await conn.execute('DELETE FROM orders WHERE 1=1');
+      }
+
+      // Group rows by order_no
+      const orderMap = new Map();
+      rawRows.forEach(r => {
+        const on = r.order_no;
+        if (!orderMap.has(on)) orderMap.set(on, { ...r, pallets: [] });
+        orderMap.get(on).pallets.push({
+          pallet_id:     r.pallet_id,
+          pkg_type:      r.pkg_type,
+          location_type: r.location_type,
+          staging_loc:   r.staging_loc,
+        });
+      });
+
+      for (const [orderNo, data] of orderMap) {
+        try {
+          const [[existing]] = await conn.execute(
+            'SELECT id FROM orders WHERE order_no=?', [orderNo]
+          );
+
+          if (mode === 'append' && existing) { skipped++; continue; }
+
+          const status = validStatus(data.status);
+          const vals   = [
+            sanitise(data.shipment_no||'',60), sanitise(data.client_id||'',40),
+            sanitise(data.customer_name,120), sanitise(data.dest_country,80),
+            sanitise(data.carrier,80), sanitise(data.service_level,60),
+            sanitise(data.tracking_no,120), parseDate(data.scheduled_ship_date),
+            parseDate(data.inbound_dt), parseDate(data.outbound_dt),
+            status, sanitise(data.internal_ref,255), sanitise(data.shipping_notes),
+          ];
+
+          if (existing && (mode === 'update' || mode === 'replace')) {
+            await conn.execute(
+              `UPDATE orders SET shipment_no=?,client_id=?,customer_name=?,dest_country=?,
+               carrier=?,service_level=?,tracking_no=?,scheduled_ship_date=?,inbound_dt=?,
+               outbound_dt=?,status=?,internal_ref=?,shipping_notes=?,updated_at=NOW()
+               WHERE order_no=?`,
+              [...vals, orderNo]
+            );
+            await conn.execute('DELETE FROM pallets WHERE order_no=?', [orderNo]);
+            updated++;
+          } else {
+            await conn.execute(
+              `INSERT INTO orders (order_no,shipment_no,client_id,customer_name,dest_country,
+               carrier,service_level,tracking_no,scheduled_ship_date,inbound_dt,outbound_dt,
+               status,internal_ref,shipping_notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              [orderNo, ...vals]
+            );
+            added++;
+          }
+
+          for (let i = 0; i < data.pallets.length; i++) {
+            const p = data.pallets[i];
+            await conn.execute(
+              `INSERT INTO pallets (order_no,pallet_id,pkg_type,location_type,staging_loc,status,seq_no)
+               VALUES (?,?,?,?,?,?,?)`,
+              [orderNo, sanitise(p.pallet_id,60)||`PLT-${i+1}`,
+               sanitise(p.pkg_type,60), p.location_type||'rack',
+               sanitise(p.staging_loc,80), status, i+1]
+            );
+          }
+        } catch (rowErr) {
+          errors.push({ orderNo, error: rowErr.message });
+        }
+      }
+
+      await conn.execute(
+        `INSERT INTO import_sessions (import_mode,filename,rows_processed,rows_added,rows_updated,rows_skipped,imported_by)
+         VALUES (?,?,?,?,?,?,?)`,
+        [mode, req.file.originalname, rawRows.length, added, updated, skipped, req.user.name]
+      );
+
+      await addAudit(conn, {
+        userId: req.user.id, userName: req.user.name,
+        action: 'import', entity: 'data', entityId: 'bulk',
+        after: { mode, added, updated, skipped, total: rawRows.length, file: req.file.originalname },
+      });
+
+      await conn.commit();
+      res.json({ ok: true, added, updated, skipped, total: rawRows.length, errors });
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  } catch (err) {
+    console.error('[import/csv]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
